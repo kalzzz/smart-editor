@@ -1,23 +1,23 @@
 <template>
   <div class="text-editor">
-      <h3 class="editor-title">转录文本编辑器</h3>
-      <div v-if="transcriptWords.length > 0" class="editor-content" ref="editorContainer">
+      <h3 class="editor-title">文本编辑框</h3>
+      <div v-if="transcriptWords.length > 0" class="editor-content" ref="editorContainer" @scroll="handleScroll">
           <span
               v-for="(word, index) in transcriptWords"
               :key="index"
-              :class="{ 
-                  highlight: index === highlightedWordIndex,
-                  word: true,
-                  clickable: true
+              :class="{
+                  'word': true,
+                  'clickable': true,
+                  'highlight': index === highlightedWordIndex,
+                  'selected': selectedWordIndices.includes(index)
               }"
-              :data-start="word.start"
-              :data-end="word.end"
-              :data-index="index"
               @click="seekToWord(word.start, index)"
-              :title="`${word.start.toFixed(2)}s - ${word.end.toFixed(2)}s: 点击跳转`"
-          >{{ getWordDisplay(word) }}<span v-if="index < transcriptWords.length - 1 && !isPunctuation(getWordDisplay(word)) && !isPunctuation(getWordDisplay(transcriptWords[index + 1]))">&nbsp;</span></span>
+          >
+              {{ getWordDisplay(word) }}
+          </span>
       </div>
       <div v-else class="waiting-message">
+
           <div class="loading-spinner"></div>
           <p>等待转录文本...</p>
       </div>
@@ -37,7 +37,8 @@ const props = defineProps({
       type: Number,
       default: 0,
   },
-  isVideoPlaying: { // 新增：接收来自父组件的视频播放状态
+  isVideoPlaying: { 
+
     type: Boolean,
     default: false,
   }
@@ -52,7 +53,11 @@ const editorContainer = ref(null);
 const isUserScrolling = ref(false);
 const scrollTimeout = ref(null);
 const isUserSeeking = ref(false); // 新增：标记用户是否正在手动跳转
-//const seekTimeout = ref(null); // 新增：跳转超时控制
+const selectedWordIndices = ref([]);
+
+
+
+
 
 // 监听播放时间变化，高亮当前词语
 watch(
@@ -115,6 +120,19 @@ const updateHighlight = (currentTime) => {
     }
 };
 
+
+
+
+
+
+// 点击词语选择或取消选择
+const toggleWordSelection = (wordIndex) => {
+  if (selectedWordIndices.value.includes(wordIndex)) {
+    selectedWordIndices.value = selectedWordIndices.value.filter(index => index !== wordIndex);
+  } else {
+    selectedWordIndices.value.push(wordIndex);
+  }
+};
 // 寻找当前时间对应的词语索引 - 改进算法
 const findCurrentWordIndex = (currentTime) => {
     if (!props.transcriptWords.length) return -1;
@@ -159,7 +177,8 @@ const seekToWord = (startTime, wordIndex) => {
     
     // 立即更新高亮到点击的词语
     highlightedWordIndex.value = wordIndex;
-    
+    //
+    toggleWordSelection(wordIndex);
     // 标记用户正在跳转
     isUserSeeking.value = true;
     
@@ -175,6 +194,53 @@ const seekToWord = (startTime, wordIndex) => {
     scrollTimeout.value = setTimeout(() => {
         isUserScrolling.value = false;
     }, 3000); // 3秒后恢复自动滚动
+};
+
+// 获取选中的删除时间段
+const getSelectedDeleteSegments = () => {
+  if (selectedWordIndices.value.length === 0) {
+    return [];
+  }
+
+  const segments = [];
+  // Sort indices to easily group contiguous words
+  const sortedIndices = [...selectedWordIndices.value].sort((a, b) => a - b);
+
+  let currentSegment = null;
+
+  for (let i = 0; i < sortedIndices.length; i++) {
+    const wordIndex = sortedIndices[i];
+    const word = props.transcriptWords[wordIndex];
+
+    if (!currentSegment) {
+      currentSegment = {
+        start: word.start,
+        end: word.end
+      };
+    } else if (wordIndex === sortedIndices[i - 1] + 1) {
+      // 如果是连续的词，更新结束时间
+      currentSegment.end = word.end;
+    } else {
+      // 如果不连续，保存当前片段并开始新片段
+      segments.push(currentSegment);
+      currentSegment = {
+        start: word.start,
+        end: word.end
+      };
+    }
+  }
+
+  // Push the last segment being built
+  if (currentSegment) {
+    segments.push(currentSegment);
+  }
+
+  return segments;
+};
+
+// 清除选中的词语
+const clearSelectedWords = () => {
+  selectedWordIndices.value = [];
 };
 
 // 自动滚动到高亮的词语
@@ -237,8 +303,11 @@ defineExpose({
         isUserScrolling.value = false;
         clearTimeout(scrollTimeout.value);
         isUserSeeking.value = false; // 重置用户跳转状态
-    }
+    },
+    getSelectedDeleteSegments, // 暴露获取删除片段的方法
+    clearSelectedWords,      // 暴露清除选中词语的方法
 });
+
 </script>
 
 <style scoped>
@@ -316,6 +385,20 @@ defineExpose({
     z-index: 1;
     animation: highlightPulse 0.6s cubic-bezier(0.4, 0, 0.2, 1);
     border: 1px solid rgba(255, 193, 7, 0.4);
+}
+
+.word.selected {
+    background-color: rgba(244, 67, 54, 0.2);
+    border: 1px solid rgba(244, 67, 54, 0.4);
+    color: #d32f2f;
+    font-weight: 600;
+}
+
+.word.selected.highlight {
+    background: linear-gradient(135deg, #ffeb3b, #ff9800);
+    color: #d32f2f;
+    font-weight: 700;
+    box-shadow: 0 3px 12px rgba(255, 152, 0, 0.6);
 }
 
 @keyframes highlightPulse {

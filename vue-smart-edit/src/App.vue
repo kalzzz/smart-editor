@@ -1,8 +1,7 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, watch } from 'vue';
 import axios from 'axios';
 
-import TextEditor from './components/TextEditor.vue';
 
 const selectedFile = ref(null);
 const transcript = ref('');
@@ -19,6 +18,16 @@ const clipPath = ref('');
 const clipError = ref('');
 const isVideoActuallyPlaying = ref(false); // Track video play state
 const transcriptWords = ref([]);
+const isTranscribing = ref(false); // 新增：标记是否正在转录
+import TextEditor from './components/TextEditor.vue';
+
+// 监听转录状态，控制视频播放
+watch(isTranscribing, (newValue) => {
+    if (newValue && player.value && !player.value.paused) {
+        // 如果开始转录且视频正在播放，就暂停视频
+        player.value.pause();
+    }
+});
 
 // 处理文件上传事件
 const handleFileUpload = (event) => {
@@ -73,8 +82,11 @@ const uploadFile = async () => {
 const transcribeFile = async (filePath) => {
     try {
         console.log('转录，文件路径:', filePath);
+        isTranscribing.value = true; // 设置转录状态为true
+        transcribeStatus.value = '转录中...';
+        
         const transcribeResponse = await axios.post('http://127.0.0.1:8000/transcribe',
-            filePath ,
+            filePath,
             {
                 headers: {
                     'Content-Type': 'application/json'
@@ -87,6 +99,8 @@ const transcribeFile = async (filePath) => {
         transcribeError.value = `转录失败: ${error.response?.data?.detail || error.message || error}`;
         console.error(error);
         transcribeStatus.value = '转录失败';
+    } finally {
+        isTranscribing.value = false; // 设置转录状态为false
     }
 };
 
@@ -123,6 +137,16 @@ const handleVideoPauseOrEnded = () => {
     isVideoActuallyPlaying.value = false;
 };
 
+// 处理视频播放尝试
+const handleVideoPlay = (event) => {
+    if (isTranscribing.value) {
+        event.preventDefault(); // 阻止视频播放
+        if (player.value) {
+            player.value.pause(); // 确保视频暂停
+        }
+    }
+};
+
 // 剪辑视频
 const clipVideo = async () => {
     if (!clipPath.value) {
@@ -135,7 +159,12 @@ const clipVideo = async () => {
     }
 
     try {
-        const relativeFilePath = clipPath.value.replace('http://127.0.0.1:8000/', '');
+        let relativeFilePath = clipPath.value.replace('http://127.0.0.1:8000/', '');
+        // 如果路径不包含任何目录前缀，添加 uploads/ 前缀
+        if (!relativeFilePath.includes('/')) {
+            relativeFilePath = `uploads/${relativeFilePath}`;
+        }
+        console.log('剪辑视频，使用文件路径:', relativeFilePath);
 
         const clipResponse = await axios.post('http://127.0.0.1:8000/clip_video', {
             file_path: relativeFilePath,
@@ -165,6 +194,110 @@ onMounted(() => {
     startTime.value = 0;
     endTime.value = 0;
 });
+
+const textEditorRef = ref(null);
+
+// 处理删除选中的文本并剪辑视频
+const deleteSelectedText = async () => {
+    // 获取编辑器中选中的时间段
+    const segments = textEditorRef.value.getSelectedDeleteSegments();
+    
+    if (!segments || segments.length === 0) {
+        clipError.value = '请选择要删除的文本';
+        return;
+    }
+
+    if (!clipPath.value) {
+        clipError.value = '请先上传视频';
+        return;
+    }
+
+    // 开始处理前暂停视频
+    if (player.value && !player.value.paused) {
+        player.value.pause();
+    }
+
+    try {
+        let relativeFilePath = clipPath.value.replace('http://127.0.0.1:8000/', '');
+        // 如果路径不包含任何目录前缀，添加 uploads/ 前缀
+        if (!relativeFilePath.includes('/')) {
+            relativeFilePath = `uploads/${relativeFilePath}`;
+        }
+        console.log('删除选中文本，使用文件路径:', relativeFilePath);
+        const response = await axios.post('http://127.0.0.1:8000/cut', {
+            file_path: relativeFilePath,
+            delete_segments: segments
+        });
+
+        // 获取任务ID并轮询状态
+        const taskId = response.data.task_id;
+        isTranscribing.value = true; // 设置转录状态为true，阻止视频播放
+        
+        // 定期检查任务状态
+        const checkStatus = async () => {
+            try {
+                const statusResponse = await axios.get(`http://127.0.0.1:8000/cut/status/${taskId}`);
+                const status = statusResponse.data;
+
+                if (status.status === 'completed' && status.result) {
+                    // 更新视频预览地址
+                    const newVideoUrl = `http://127.0.0.1:8000/${status.result.preview_url}`;
+                    clipPath.value = newVideoUrl;
+                    clipError.value = '';
+                    transcribeStatus.value = '剪辑成功，正在重新转录...';
+                    
+                    // 清除编辑器中的选中状态
+                    textEditorRef.value.clearSelectedWords();
+
+                    // 自动触发新视频的转录
+                    try {
+                        // 等待一小段时间确保文件已经完全写入
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        transcribeStatus.value = '转录中...';
+                        
+                        const transcribeResponse = await axios.post(
+                            'http://127.0.0.1:8000/transcribe', 
+                            status.result.preview_url,
+                            {
+                                headers: {
+                                    'Content-Type': 'application/json'
+                                }
+                            }
+                        );
+                        if (transcribeResponse.data.transcript) {
+                            transcriptWords.value = transcribeResponse.data.transcript;
+                            transcribeStatus.value = '转录完成';
+                        }
+                    } catch (error) {
+                        transcribeError.value = `转录失败: ${error.response?.data?.detail || error.message}`;
+                        transcribeStatus.value = '转录失败';
+                    } finally {
+                        isTranscribing.value = false; // 转录完成，允许视频播放
+                    }
+                    return;
+                } else if (status.status === 'failed') {
+                    clipError.value = `剪辑失败: ${status.error_message}`;
+                    isTranscribing.value = false; // 如果失败也要重置状态
+                    return;
+                }
+
+                // 继续轮询
+                setTimeout(checkStatus, 1000);
+            } catch (error) {
+                clipError.value = `获取任务状态失败: ${error.message}`;
+                isTranscribing.value = false; // 如果失败也要重置状态
+            }
+        };
+
+        // 开始轮询
+        checkStatus();
+        
+    } catch (error) {
+        clipError.value = `剪辑失败: ${error.response?.data?.detail || error.message || error}`;
+        console.error(error);
+        isTranscribing.value = false; // 如果失败也要重置状态
+    }
+};
 </script>
 
 <template>
@@ -214,6 +347,7 @@ onMounted(() => {
                         @playing="handleVideoPlaying"
                         @pause="handleVideoPauseOrEnded"
                         @ended="handleVideoPauseOrEnded"
+                        @play="handleVideoPlay"
                         class="video-player"
                     ></video>
                     
@@ -257,6 +391,9 @@ onMounted(() => {
                         <div v-if="clipError" class="error-message">{{ clipError }}</div>
                     </div>
                 </div>
+                <button @click="deleteSelectedText" class="delete-btn">
+                  删除选中
+                </button>
             </div>
 
             <!-- 转录文本显示区域 -->
@@ -267,6 +404,7 @@ onMounted(() => {
                     @seek-to-time="handleSeekToTime"
                     @pause-video="handlePauseVideo"
                     :is-video-playing="isVideoActuallyPlaying"
+                    ref="textEditorRef"
                 />
             </div>
         </div>
@@ -620,6 +758,24 @@ html, body {
     .title {
         font-size: 20px;
         margin-bottom: 12px;
+    }
+    .delete-btn {
+      background: linear-gradient(135deg, #e74c3c, #c0392b);
+      color: white;
+      padding: 12px 24px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 16px;
+      font-weight: 600;
+      transition: all 0.3s ease;
+      box-shadow: 0 2px 8px rgba(231, 76, 60, 0.3);
+    }
+
+    .delete-btn:hover {
+      background: linear-gradient(135deg, #c0392b, #e74c3c);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(231, 76, 60, 0.4);
     }
 }
 </style>
