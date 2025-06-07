@@ -593,16 +593,28 @@ async def transcribe_audio(file_path: Annotated[str, Body()]):
         logger.info(f"识别完成，获得 {len(results)} 个词语")
 
         # 保存转录结果到数据库
-        db = SessionLocal()
+        db = SessionLocal()        
         try:
             # 存储相对路径到数据库
             relative_path = f"uploads/{os.path.basename(file_path)}"  # 不带前导斜杠
-            transcription_record = Transcription(
-                video_id=os.path.basename(file_path),
-                file_path=relative_path,
-                transcription=json.dumps(results, ensure_ascii=False)
-            )
-            db.merge(transcription_record)  # 使用merge而不是add，避免重复键错误
+            video_id = os.path.basename(file_path)
+            
+            # 首先尝试查找现有记录
+            existing_record = db.query(Transcription).filter_by(video_id=video_id).first()
+            
+            if existing_record:
+                # 更新现有记录
+                existing_record.file_path = relative_path
+                existing_record.transcription = json.dumps(results, ensure_ascii=False)
+            else:
+                # 创建新记录
+                transcription_record = Transcription(
+                    video_id=video_id,
+                    file_path=relative_path,
+                    transcription=json.dumps(results, ensure_ascii=False)
+                )
+                db.add(transcription_record)
+                
             db.commit()
         finally:
             db.close()

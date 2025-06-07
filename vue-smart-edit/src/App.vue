@@ -1,7 +1,10 @@
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import axios from 'axios';
+import { useEditorStore } from './stores/editorStore';
+import TextEditor from './components/TextEditor.vue';
 
+const editorStore = useEditorStore();
 
 const selectedFile = ref(null);
 const transcript = ref('');
@@ -19,7 +22,32 @@ const clipError = ref('');
 const isVideoActuallyPlaying = ref(false); // Track video play state
 const transcriptWords = ref([]);
 const isTranscribing = ref(false); // 新增：标记是否正在转录
-import TextEditor from './components/TextEditor.vue';
+const textEditorRef = ref(null);
+
+// 监听视频路径变化，更新转录文本
+watch(clipPath, async (newPath, oldPath) => {
+    if (isUndoRedoOperation.value) {
+        // 如果是撤销/重做操作，不触发转录
+        isUndoRedoOperation.value = false;
+        return;
+    }
+    
+    if (newPath && newPath !== oldPath && !isTranscribing.value) {
+        // 重置转录状态
+        transcriptWords.value = [];
+        // 开始新的转录
+        await transcribeFile(newPath);
+    }
+}, { immediate: false });
+
+// 标记视频是否被修改过
+const isVideoModified = ref(false);
+// 添加标记是否是撤销/重做操作的状态
+const isUndoRedoOperation = ref(false);
+
+// 计算属性：检查撤销/重做状态
+const canUndo = computed(() => editorStore.canUndo() && !isTranscribing.value);
+const canRedo = computed(() => editorStore.canRedo() && !isTranscribing.value);
 
 // 监听转录状态，控制视频播放
 watch(isTranscribing, (newValue) => {
@@ -56,8 +84,10 @@ const uploadFile = async () => {
     formData.append('file', selectedFile.value);
 
     try {
+        // 1. 上传文件
         const uploadResponse = await axios.post('http://127.0.0.1:8000/upload', formData, {
-            headers: {
+            headers:
+            {
                 'Content-Type': 'multipart/form-data',
             },
             onUploadProgress: (progressEvent) => {
@@ -66,9 +96,11 @@ const uploadFile = async () => {
         });
 
         const filePath = uploadResponse.data.path;
-        transcribeStatus.value = '转录中...';
-        await transcribeFile(filePath);
-        clipPath.value = `http://127.0.0.1:8000/${filePath}`;
+        const fullPath = `http://127.0.0.1:8000/${filePath}`;
+        clipPath.value = fullPath;
+
+        // 2. 等待转录完成
+        await transcribeFile(fullPath);
 
     } catch (error) {
         uploadError.value = `文件上传失败: ${error.response?.data?.detail || error.message || error}`;
@@ -85,16 +117,34 @@ const transcribeFile = async (filePath) => {
         isTranscribing.value = true; // 设置转录状态为true
         transcribeStatus.value = '转录中...';
         
+        // 清除之前选中的文本
+        if (textEditorRef.value) {
+            textEditorRef.value.clearSelectedWords();
+        }
+
+        // 从 URL 中提取相对路径
+        const relativePath = filePath.replace('http://127.0.0.1:8000/', '');
+
         const transcribeResponse = await axios.post('http://127.0.0.1:8000/transcribe',
-            filePath,
+            JSON.stringify(relativePath),
             {
                 headers: {
                     'Content-Type': 'application/json'
                 }
             }
         );
-        transcriptWords.value = transcribeResponse.data.transcript || [];
-        transcribeStatus.value = '转录完成';
+        
+        // 更新转录文本
+        const newTranscript = transcribeResponse.data.transcript || [];
+        
+        // 只有在新转录文本与当前不同时才更新
+        if (JSON.stringify(newTranscript) !== JSON.stringify(transcriptWords.value)) {
+            transcriptWords.value = newTranscript;
+            transcribeStatus.value = '转录完成';
+        } else {
+            transcribeStatus.value = '使用现有转录';
+        }
+        
     } catch (error) {
         transcribeError.value = `转录失败: ${error.response?.data?.detail || error.message || error}`;
         console.error(error);
@@ -193,9 +243,14 @@ const setCurrentAsEnd = () => {
 onMounted(() => {
     startTime.value = 0;
     endTime.value = 0;
+    window.addEventListener('keydown', handleKeyDown);
 });
 
-const textEditorRef = ref(null);
+// 在组件卸载时移除快捷键监听
+onUnmounted(() => {
+    window.removeEventListener('keydown', handleKeyDown);
+});
+
 
 // 处理删除选中的文本并剪辑视频
 const deleteSelectedText = async () => {
@@ -219,11 +274,13 @@ const deleteSelectedText = async () => {
 
     try {
         let relativeFilePath = clipPath.value.replace('http://127.0.0.1:8000/', '');
-        // 如果路径不包含任何目录前缀，添加 uploads/ 前缀
         if (!relativeFilePath.includes('/')) {
             relativeFilePath = `uploads/${relativeFilePath}`;
         }
-        console.log('删除选中文本，使用文件路径:', relativeFilePath);
+
+        isTranscribing.value = true;
+        transcribeStatus.value = '正在处理视频...';
+
         const response = await axios.post('http://127.0.0.1:8000/cut', {
             file_path: relativeFilePath,
             delete_segments: segments
@@ -231,72 +288,229 @@ const deleteSelectedText = async () => {
 
         // 获取任务ID并轮询状态
         const taskId = response.data.task_id;
-        isTranscribing.value = true; // 设置转录状态为true，阻止视频播放
-        
-        // 定期检查任务状态
-        const checkStatus = async () => {
-            try {
-                const statusResponse = await axios.get(`http://127.0.0.1:8000/cut/status/${taskId}`);
-                const status = statusResponse.data;
 
-                if (status.status === 'completed' && status.result) {
-                    // 更新视频预览地址
-                    const newVideoUrl = `http://127.0.0.1:8000/${status.result.preview_url}`;
-                    clipPath.value = newVideoUrl;
-                    clipError.value = '';
-                    transcribeStatus.value = '剪辑成功，正在重新转录...';
-                    
-                    // 清除编辑器中的选中状态
-                    textEditorRef.value.clearSelectedWords();
+        // 在视频和文本都处理前，保存状态
+        if (!editorStore.getInitialState()) {
+            editorStore.saveInitialState({
+                transcriptWords: [...transcriptWords.value],
+                selectedIndices: [],
+                deleteSegments: [],
+                originalVideoPath: clipPath.value,
+                isModified: false
+            });
+        }
 
-                    // 自动触发新视频的转录
-                    try {
-                        // 等待一小段时间确保文件已经完全写入
-                        await new Promise(resolve => setTimeout(resolve, 1000));
-                        transcribeStatus.value = '转录中...';
-                        
-                        const transcribeResponse = await axios.post(
-                            'http://127.0.0.1:8000/transcribe', 
-                            status.result.preview_url,
-                            {
-                                headers: {
-                                    'Content-Type': 'application/json'
-                                }
-                            }
-                        );
-                        if (transcribeResponse.data.transcript) {
-                            transcriptWords.value = transcribeResponse.data.transcript;
-                            transcribeStatus.value = '转录完成';
-                        }
-                    } catch (error) {
-                        transcribeError.value = `转录失败: ${error.response?.data?.detail || error.message}`;
-                        transcribeStatus.value = '转录失败';
-                    } finally {
-                        isTranscribing.value = false; // 转录完成，允许视频播放
-                    }
-                    return;
-                } else if (status.status === 'failed') {
-                    clipError.value = `剪辑失败: ${status.error_message}`;
-                    isTranscribing.value = false; // 如果失败也要重置状态
-                    return;
-                }
-
-                // 继续轮询
-                setTimeout(checkStatus, 1000);
-            } catch (error) {
-                clipError.value = `获取任务状态失败: ${error.message}`;
-                isTranscribing.value = false; // 如果失败也要重置状态
-            }
-        };
-
-        // 开始轮询
-        checkStatus();
+        // 传递当前选中的片段给 waitForProcessing
+        await waitForProcessing(taskId, segments);
         
     } catch (error) {
-        clipError.value = `剪辑失败: ${error.response?.data?.detail || error.message || error}`;
-        console.error(error);
-        isTranscribing.value = false; // 如果失败也要重置状态
+        clipError.value = `处理失败: ${error.response?.data?.detail || error.message || error}`;
+        isTranscribing.value = false;
+        transcribeStatus.value = '处理失败';
     }
+};
+
+// 下载视频
+const downloadVideo = async () => {
+    if (!clipPath.value) {
+        clipError.value = '请先上传视频';
+        return;
+    }
+
+    try {
+        const response = await axios.get(clipPath.value, {
+            responseType: 'blob' // 以二进制blob形式下载
+        });
+
+        // 创建下载链接
+        const url = window.URL.createObjectURL(new Blob([response.data]));
+        const link = document.createElement('a');
+        link.href = url;
+        
+        // 从路径中提取文件名
+        const fileName = clipPath.value.split('/').pop() || 'video.mp4';
+        link.setAttribute('download', fileName);
+
+        // 触发下载
+        document.body.appendChild(link);
+        link.click();
+
+        // 清理
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
+    } catch (error) {
+        clipError.value = `下载失败: ${error.message}`;
+        console.error('下载视频失败:', error);
+    }
+};
+
+// 撤销操作 - 恢复到上一次编辑的状态
+const handleUndo = async () => {
+    if (!canUndo.value) return;
+    
+    // 设置标记，表示这是撤销操作
+    isUndoRedoOperation.value = true;
+    
+    const previousState = editorStore.undo();
+    if (previousState) {
+        // 更新界面状态
+        transcriptWords.value = previousState.transcriptWords;
+        if (textEditorRef.value) {
+            textEditorRef.value.setSelectedWords([]);
+        }
+        
+        // 获取初始状态，检查是否回到了初始状态
+        const isInitial = editorStore.isInitialState();
+        
+        // 恢复视频状态
+        clipPath.value = previousState.originalVideoPath;
+        transcribeStatus.value = isInitial ? '已恢复到最初状态' : '已恢复到上一次编辑的状态';
+        isVideoModified.value = !isInitial;
+    }
+};
+
+// 重做操作 - 恢复到下一个编辑状态
+const handleRedo = async () => {
+    if (!canRedo.value) return;
+    
+    // 设置标记，表示这是重做操作
+    isUndoRedoOperation.value = true;
+    
+    const nextState = editorStore.redo();
+    if (nextState) {
+        // 更新界面状态
+        transcriptWords.value = nextState.transcriptWords;
+        if (textEditorRef.value) {
+            textEditorRef.value.setSelectedWords([]);
+        }
+        
+        // 恢复视频状态
+        clipPath.value = nextState.originalVideoPath;
+        // 确定是否回到了初始状态
+        const isInitial = editorStore.isInitialState();
+        transcribeStatus.value = isInitial ? '已恢复到最初状态' : '已恢复到编辑后的状态';
+        
+        // 更新修改状态
+        isVideoModified.value = nextState.isModified;
+    }
+};
+
+// 添加快捷键支持
+const handleKeyDown = (event) => {
+    // 如果在输入框中，不处理快捷键
+    if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') {
+        return;
+    }
+    
+    // Ctrl/Cmd + Z: 撤销
+    if ((event.ctrlKey || event.metaKey) && event.key === 'z' && !event.shiftKey) {
+        event.preventDefault();
+        if (canUndo.value) {
+            handleUndo();
+        }
+    }
+    // Ctrl/Cmd + Shift + Z 或 Ctrl/Cmd + Y: 重做
+    else if (((event.ctrlKey || event.metaKey) && event.key === 'z' && event.shiftKey) ||
+             ((event.ctrlKey || event.metaKey) && event.key === 'y')) {
+        event.preventDefault();
+        if (canRedo.value) {
+            handleRedo();
+        }
+    }
+};
+
+// 处理视频片段
+const processVideoWithSegments = async (segments) => {
+    if (!clipPath.value) {
+        isTranscribing.value = false;
+        return;
+    }
+    
+    try {
+        let relativeFilePath = clipPath.value.replace('http://127.0.0.1:8000/', '');
+        if (!relativeFilePath.includes('/')) {
+            relativeFilePath = `uploads/${relativeFilePath}`;
+        }
+        
+        isTranscribing.value = true;
+        transcribeStatus.value = '正在处理视频...';
+        
+        const response = await axios.post('http://127.0.0.1:8000/cut', {
+            file_path: relativeFilePath,
+            delete_segments: segments
+        });
+        
+        const taskId = response.data.task_id;
+        await waitForProcessing(taskId);
+        
+    } catch (error) {
+        clipError.value = `处理失败: ${error.response?.data?.detail || error.message || error}`;
+        isTranscribing.value = false;
+        transcribeStatus.value = '处理失败';
+    }
+};
+
+// 等待处理完成
+const waitForProcessing = async (taskId, deleteSegments) => {
+    const checkStatus = async () => {
+        try {
+            const statusResponse = await axios.get(`http://127.0.0.1:8000/cut/status/${taskId}`);
+            const status = statusResponse.data;
+
+            if (status.status === 'completed' && status.result) {
+                // 更新视频路径为新的预览视频
+                const newVideoPath = `http://127.0.0.1:8000/${status.result.preview_url}`;
+                clipPath.value = newVideoPath;
+                transcribeStatus.value = '视频处理完成，开始转录...';
+
+                // 清除选中的文本
+                textEditorRef.value.clearSelectedWords();
+                
+                // 触发新视频的转录
+                await transcribeFile(newVideoPath);
+
+                // 保存新的编辑状态
+                editorStore.saveState({
+                    transcriptWords: [...transcriptWords.value],
+                    selectedIndices: textEditorRef.value.getSelectedIndices(),
+                    deleteSegments: [...deleteSegments],
+                    originalVideoPath: clipPath.value,
+                    isModified: true
+                });
+
+                return;
+            } else if (status.status === 'failed') {
+                clipError.value = `处理失败: ${status.error_message}`;
+                isTranscribing.value = false;
+                transcribeStatus.value = '处理失败';
+                return;
+            }
+
+            // 继续轮询
+            setTimeout(checkStatus, 1000);
+        } catch (error) {
+            clipError.value = `获取任务状态失败: ${error.message}`;
+            isTranscribing.value = false;
+            transcribeStatus.value = '处理失败';
+        }
+    };
+
+    await checkStatus();
+};
+
+// 重置所有状态
+const resetState = () => {
+    selectedFile.value = null;
+    transcript.value = '';
+    uploadError.value = '';
+    transcribeError.value = '';
+    loading.value = false;
+    uploadProgress.value = 0;
+    transcribeStatus.value = '';
+    clipPath.value = '';
+    clipError.value = '';
+    isVideoActuallyPlaying.value = false;
+    isVideoModified.value = false; // 重置视频修改状态
 };
 </script>
 
@@ -312,17 +526,23 @@ const deleteSelectedText = async () => {
                 accept="video/*,audio/*" 
                 class="file-input"
             >
-            <button 
-                @click="uploadFile" 
-                :disabled="loading" 
-                class="upload-btn"
-            >
-                {{ loading ? '上传中...' : '上传并转录' }}
-            </button>
+            <div class="upload-controls">
+                <button 
+                    @click="uploadFile" 
+                    :disabled="loading" 
+                    class="upload-btn"
+                >
+                    {{ loading ? '上传中...' : '上传并转录' }}
+                </button>
+                
+                <div v-if="!loading && clipPath" class="state-badge">
+                    状态{{ editorStore.$state.stateCounter }}
+                </div>
+            </div>
 
             <div v-if="uploadProgress > 0" class="progress-container">
                 <div 
-                    class="progress-bar" 
+                    class="progress-bar"
                     :style="{ width: `${uploadProgress}%` }"
                 ></div>
                 <span class="progress-label">{{ uploadProgress }}%</span>
@@ -338,73 +558,78 @@ const deleteSelectedText = async () => {
             <!-- 视频播放和控制区域 -->
             <div class="video-section">
                 <div v-if="clipPath" class="video-container">
-                    <video 
-                        ref="player" 
-                        :src="clipPath" 
-                        controls 
-                        autoplay 
+                    <video
+                        ref="player"
+                        class="video-player"
+                        :src="clipPath"
+                        controls
                         @timeupdate="handleTimeUpdate"
-                        @playing="handleVideoPlaying"
+                        @play="handleVideoPlaying"
                         @pause="handleVideoPauseOrEnded"
                         @ended="handleVideoPauseOrEnded"
-                        @play="handleVideoPlay"
-                        class="video-player"
+                        @playing="handleVideoPlay"
                     ></video>
                     
-                    <div class="clip-controls">
-                        <div class="time-input-group">
-                            <label>开始时间:</label>
-                            <input 
-                                type="number" 
-                                v-model.number="startTime" 
-                                step="0.1" 
-                                class="time-input"
-                            >
-                            <span>秒</span>
-                            <button @click="setCurrentAsStart" class="time-set-btn">
-                                设为当前时间
-                            </button>
-                        </div>
-                        
-                        <div class="time-input-group">
-                            <label>结束时间:</label>
-                            <input 
-                                type="number" 
-                                v-model.number="endTime" 
-                                step="0.1" 
-                                class="time-input"
-                            >
-                            <span>秒</span>
-                            <button @click="setCurrentAsEnd" class="time-set-btn">
-                                设为当前时间
-                            </button>
-                        </div>
-                        
+                    <!-- 视频控制区域 -->
+                    <div class="video-controls">
+                        <!-- 当前时间显示 -->
                         <div class="current-time">
-                            当前播放时间: {{ currentTime.toFixed(2) }} 秒
+                            当前时间: {{ currentTime.toFixed(1) }}秒
                         </div>
                         
-                        <button @click="clipVideo" class="clip-btn">
-                            剪辑视频
-                        </button>
-                        
-                        <div v-if="clipError" class="error-message">{{ clipError }}</div>
+                        <!-- 编辑控制区 -->
+                        <div class="edit-controls">
+                            <button 
+                                @click="handleUndo" 
+                                class="control-btn undo-btn"
+                                :disabled="!canUndo"
+                                title="撤销 (Ctrl+Z)"
+                            >
+                                撤销
+                            </button>
+                            
+                            <button 
+                                @click="handleRedo" 
+                                class="control-btn redo-btn"
+                                :disabled="!canRedo"
+                                title="重做 (Ctrl+Y)"
+                            >
+                                重做
+                            </button>
+                            
+                            <button 
+                                @click="deleteSelectedText" 
+                                class="delete-btn"
+                                :disabled="isTranscribing"
+                            >
+                                删除选中文本
+                            </button>
+                            
+                            <button 
+                                @click="downloadVideo" 
+                                class="download-btn"
+                                :disabled="!clipPath || isTranscribing"
+                            >
+                                下载预览视频
+                            </button>
+                        </div>
                     </div>
                 </div>
-                <button @click="deleteSelectedText" class="delete-btn">
-                  删除选中
-                </button>
+                <div v-if="isTranscribing" class="loading-overlay">
+                    <div class="loading-spinner"></div>
+                    <p>视频处理中...</p>
+                </div>
             </div>
 
             <!-- 转录文本显示区域 -->
             <div class="transcript-section">
                 <TextEditor 
-                    :transcriptWords="transcriptWords" 
-                    :currentTime="currentTime" 
+                    ref="textEditorRef"
+                    :transcriptWords="transcriptWords"
+                    :currentTime="currentTime"
+                    :isVideoPlaying="isVideoActuallyPlaying"
                     @seek-to-time="handleSeekToTime"
                     @pause-video="handlePauseVideo"
-                    :is-video-playing="isVideoActuallyPlaying"
-                    ref="textEditorRef"
                 />
             </div>
         </div>
@@ -591,77 +816,73 @@ html, body {
     background: #000;
 }
 
-.clip-controls {
+.video-controls {
     display: flex;
-    flex-direction: column;
-    gap: 12px;
-    flex-shrink: 0;
-}
-
-.time-input-group {
-    display: flex;
+    justify-content: space-between;
     align-items: center;
-    gap: 8px;
+    gap: 16px;
+    padding: 16px;
+    background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+    border-radius: 12px;
+    border: 1px solid #dee2e6;
+    margin-top: 16px;
     flex-wrap: wrap;
-    padding: 12px;
-    background-color: #f8f9fa;
-    border-radius: 8px;
-    border: 1px solid #e9ecef;
-}
-
-.time-input-group label {
-    font-weight: 600;
-    color: #34495e;
-    min-width: 80px;
-    font-size: 14px;
-}
-
-.time-input {
-    width: 100px;
-    padding: 8px 12px;
-    border: 2px solid #ddd;
-    border-radius: 6px;
-    font-size: 14px;
-    transition: border-color 0.3s ease;
-}
-
-.time-input:focus {
-    outline: none;
-    border-color: #3498db;
-    box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.1);
-}
-
-.time-set-btn {
-    background: linear-gradient(135deg, #95a5a6, #7f8c8d);
-    color: white;
-    padding: 8px 12px;
-    border: none;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 12px;
-    font-weight: 500;
-    transition: all 0.3s ease;
-    box-shadow: 0 1px 4px rgba(149, 165, 166, 0.3);
-}
-
-.time-set-btn:hover {
-    background: linear-gradient(135deg, #7f8c8d, #95a5a6);
-    transform: translateY(-1px);
 }
 
 .current-time {
-    background: linear-gradient(135deg, #ecf0f1, #d5dbdb);
-    padding: 12px 16px;
-    border-radius: 8px;
-    font-size: 16px;
-    color: #2c3e50;
-    text-align: center;
     font-weight: 600;
-    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.1);
+    color: #34495e;
+    font-size: 14px;
 }
 
-.clip-btn {
+.state-counter {
+    font-weight: 600;
+    color: #8e44ad;
+    font-size: 14px;
+    flex-shrink: 0;
+}
+
+.edit-controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.control-btn {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    transition: all 0.3s ease;
     background: linear-gradient(135deg, #3498db, #2980b9);
+    color: white;
+    box-shadow: 0 2px 6px rgba(52, 152, 219, 0.3);
+}
+
+.control-btn:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 3px 8px rgba(52, 152, 219, 0.4);
+}
+
+.undo-btn {
+    background: linear-gradient(135deg, #34495e, #2c3e50);
+}
+
+.redo-btn {
+    background: linear-gradient(135deg, #2c3e50, #34495e);
+}
+
+.control-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}
+
+.delete-btn {
+    background: linear-gradient(135deg, #e74c3c, #c0392b);
     color: white;
     padding: 12px 24px;
     border: none;
@@ -670,13 +891,71 @@ html, body {
     font-size: 16px;
     font-weight: 600;
     transition: all 0.3s ease;
-    box-shadow: 0 2px 8px rgba(52, 152, 219, 0.3);
+    box-shadow: 0 2px 8px rgba(231, 76, 60, 0.3);
 }
 
-.clip-btn:hover {
-    background: linear-gradient(135deg, #2980b9, #3498db);
+.delete-btn:hover:not(:disabled) {
+    background: linear-gradient(135deg, #c0392b, #e74c3c);
     transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(52, 152, 219, 0.4);
+    box-shadow: 0 4px 12px rgba(231, 76, 60, 0.4);
+}
+
+.download-btn {
+    background: linear-gradient(135deg, #2ecc71, #27ae60);
+    color: white;
+    padding: 12px 24px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 16px;
+    font-weight: 600;
+    transition: all 0.3s ease;
+    box-shadow: 0 2px 8px rgba(46, 204, 113, 0.3);
+}
+
+.download-btn:hover:not(:disabled) {
+    background: linear-gradient(135deg, #27ae60, #2ecc71);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(46, 204, 113, 0.4);
+}
+
+.delete-btn:disabled,
+.download-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}
+
+.loading-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(255, 255, 255, 0.9);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    border-radius: 12px;
+    z-index: 10;
+}
+
+.loading-overlay .loading-spinner {
+    width: 48px;
+    height: 48px;
+    border: 4px solid rgba(52, 152, 219, 0.3);
+    border-top: 4px solid #3498db;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin-bottom: 16px;
+}
+
+.loading-overlay p {
+    color: #2980b9;
+    font-size: 18px;
+    font-weight: 500;
 }
 
 .transcript-section {
@@ -689,6 +968,24 @@ html, body {
     overflow: hidden;
     display: flex;
     flex-direction: column;
+}
+
+/* 新增状态标记样式 */
+.upload-controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.state-badge {
+    background: #8e44ad;
+    color: white;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    box-shadow: 0 2px 4px rgba(142, 68, 173, 0.2);
 }
 
 /* 响应式设计 */
@@ -759,23 +1056,11 @@ html, body {
         font-size: 20px;
         margin-bottom: 12px;
     }
-    .delete-btn {
-      background: linear-gradient(135deg, #e74c3c, #c0392b);
-      color: white;
-      padding: 12px 24px;
-      border: none;
-      border-radius: 8px;
-      cursor: pointer;
-      font-size: 16px;
-      font-weight: 600;
-      transition: all 0.3s ease;
-      box-shadow: 0 2px 8px rgba(231, 76, 60, 0.3);
-    }
+}
 
-    .delete-btn:hover {
-      background: linear-gradient(135deg, #c0392b, #e74c3c);
-      transform: translateY(-1px);
-      box-shadow: 0 4px 12px rgba(231, 76, 60, 0.4);
-    }
+/* 加载动画关键帧定义 */
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
 }
 </style>

@@ -295,6 +295,15 @@ const handleScroll = () => {
     }, 2000);
 };
 
+// 添加新的方法
+const setSelectedWords = (indices) => {
+    selectedWordIndices.value = [...indices];
+};
+
+const getSelectedIndices = () => {
+    return [...selectedWordIndices.value];
+};
+
 // 导出方法供父组件调用（如果需要）
 defineExpose({
     scrollToWord: scrollToHighlightedWord,
@@ -306,6 +315,8 @@ defineExpose({
     },
     getSelectedDeleteSegments, // 暴露获取删除片段的方法
     clearSelectedWords,      // 暴露清除选中词语的方法
+    setSelectedWords,
+    getSelectedIndices,
 });
 
 </script>
