@@ -1,27 +1,37 @@
-from fastapi import FastAPI, File, UploadFile, Body, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, Body, HTTPException, BackgroundTasks, Form
 from fastapi.responses import JSONResponse
 from typing import Annotated, List, Dict, Optional
 import subprocess
 import json
 import shutil
-from vosk import Model, KaldiRecognizer, SetLogLevel
+from vosk import SetLogLevel
 import os
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
 from uuid import uuid4
 from pathlib import Path
 from datetime import datetime
 import tempfile
 import asyncio
+# 在main.py的开头配置全局日志
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from pydantic import BaseModel, Field
 import time
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
+from .transcription_service import TranscriptionService
+from .models import Base, UploadedFile, Transcription
+from .database import engine, SessionLocal
+
+# 配置全局日志格式
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # 输出到控制台
+    ]
+)
+
+# 获取logger
 logger = logging.getLogger(__name__)
 
 SetLogLevel(-1)  # Suppress Vosk logging
@@ -31,37 +41,6 @@ MAX_PREVIEW_DURATION = 600  # 预览最大时长10分钟
 MIN_SEGMENT_DURATION = 0.1  # 最小片段时长
 TEMP_FILE_CLEANUP_HOURS = 24  # 临时文件清理时间
 MAX_CONCURRENT_JOBS = 2  # 最大并发处理任务数
-
-# 创建线程池执行器
-executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS)
-
-# 全局任务状态跟踪
-processing_tasks = {}
-
-# Pydantic 模型定义
-class CutRequest(BaseModel):
-    file_path: str = Field(..., description="视频文件路径")
-    delete_segments: List[Dict[str, float]] = Field(..., description="需要删除的时间段")
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "file_path": "uploads/video.mp4",
-                "delete_segments": [{"start": 10.0, "end": 20.0}, {"start": 30.0, "end": 40.0}]
-            }
-        }
-
-class TaskStatus(BaseModel):
-    task_id: str
-    status: str  # "processing", "completed", "failed"
-    progress: int = 0
-    result: Optional[Dict] = None
-    error_message: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
-
-# Load Vosk model
-model_path = "vosk-model-small-cn-0.22"
 
 # 创建必要的目录
 app_dir = os.path.dirname(os.path.abspath(__file__))
@@ -80,14 +59,56 @@ for dir_name, dir_path in directories.items():
     except Exception as e:
         logger.error(f"创建目录 {dir_path} 时出错: {e}")
 
-if not os.path.exists(model_path):
-    logger.warning("Vosk model not found. Please download from https://alphacephei.com/vosk/models")
-    model = None
-else:
-    model = Model(model_path)
+# 创建转录服务实例
+transcription_service = TranscriptionService(
+    model_path=os.path.join(backend_dir, "models"),
+    temp_dir=directories["temp"]
+)
 
+# 创建线程池执行器
+executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS)
+
+# 全局任务状态跟踪
+processing_tasks = {}
+
+# Pydantic 模型定义
+class TranscribeRequest(BaseModel):
+    file_path: str = Field(..., description="音频文件路径")
+    model: str = Field(default="vosk", description="转录模型 (vosk 或 sensevoice)")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "file_path": "uploads/audio.wav",
+                "model": "sensevoice"
+            }
+        }
+
+class CutRequest(BaseModel):
+    file_path: str = Field(..., description="视频文件路径")
+    delete_segments: List[Dict[str, float]] = Field(..., description="需要删除的时间段")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "file_path": "uploads/video.mp4",
+                "delete_segments": [{"start": 10.0, "end": 20.0}, {"start": 30.0, "end": 40.0}]
+            }
+        }
+
+class TaskStatus(BaseModel):
+    task_id: str
+    status: str  # "processing", "completed", "failed"
+    progress: int = 0
+    result: Optional[Dict] = None
+    error_message: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+# 创建主应用
 app = FastAPI(title="Video Processing API", version="1.0.0")
 
+# CORS配置
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -96,28 +117,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 数据库配置
-engine = create_engine('sqlite:///transcriptions.db', pool_pre_ping=True)
-Base = declarative_base()
-
-class UploadedFile(Base):
-    __tablename__ = 'uploaded_files'
-    id = Column(Integer, primary_key=True)
-    unique_filename = Column(String(50), unique=True)
-    original_filename = Column(String(200))
-    file_path = Column(String(200))
-    upload_time = Column(DateTime, default=datetime.utcnow)
-    file_type = Column(String(50))
-
-class Transcription(Base):
-    __tablename__ = 'transcriptions'
-    id = Column(Integer, primary_key=True)
-    video_id = Column(String(50), unique=True)
-    file_path = Column(String(200))
-    transcription = Column(Text)
-
-Base.metadata.create_all(engine)
-SessionLocal = sessionmaker(bind=engine)
+# 初始化数据库
+Base.metadata.create_all(bind=engine)
 
 def validate_segments(segments: List[Dict], duration: float) -> List[Dict]:
     """验证并清理时间段数据"""
@@ -446,9 +447,7 @@ async def upload_file(file: Annotated[UploadFile, File()]):
 
 @app.post("/cut")
 async def cut_video(background_tasks: BackgroundTasks, request: CutRequest):
-    """
-    异步剪切视频API
-    """
+    """异步剪切视频API"""
     try:
         # 基本验证
         if not os.path.exists(request.file_path):
@@ -482,7 +481,8 @@ async def cut_video(background_tasks: BackgroundTasks, request: CutRequest):
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
-          # 提交后台任务
+        
+        # 提交后台任务
         background_tasks.add_task(
             process_video_cutting,
             task_id,
@@ -520,123 +520,68 @@ async def get_cut_status(task_id: str):
     return task
 
 @app.post("/transcribe")
-async def transcribe_audio(file_path: Annotated[str, Body()]):
-    if model is None:
-        raise HTTPException(status_code=503, detail="Speech recognition service unavailable")    # 处理URL或相对路径转换为绝对路径
-    # 首先移除可能的前导斜杠
-    file_path = file_path.lstrip('/')
-    # 分割路径，获取目录和文件名
-    path_parts = file_path.split('/')
-    if len(path_parts) >= 2:
-        directory = path_parts[0]  # 例如 "uploads" 或 "processed_videos"
-        file_name = path_parts[-1]  # 文件名
-        if directory in directories:
-            absolute_path = os.path.join(directories[directory], file_name)
-            if not os.path.exists(absolute_path):
-                raise HTTPException(status_code=400, detail=f"Input file not found: {file_path}")
-        else:
-            raise HTTPException(status_code=400, detail=f"Invalid directory: {directory}")
-    else:
-        # 如果只有文件名，默认在uploads目录中查找
-        absolute_path = os.path.join(directories["uploads"], file_path)
-        if not os.path.exists(absolute_path):
-            raise HTTPException(status_code=400, detail=f"Input file not found: {file_path}")
-        
-    # 使用绝对路径进行后续处理
-    file_path = absolute_path
-
-    audio_output_path = None
-    wf = None
+async def transcribe_audio(request: TranscribeRequest):
+    """
+    转录音频文件 - JSON请求方式
     
-    try:
-        # 创建临时音频文件
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=directories["temp"]) as temp_file:
-            audio_output_path = temp_file.name
-
-        # 转换音频
-        command = [
-            "ffmpeg", "-y",
-            "-i", file_path,
-            "-acodec", "pcm_s16le",
-            "-ar", "16000",
-            "-ac", "1",
-            audio_output_path
-        ]
-
-        logger.info(f"开始转换音频: {file_path}")
-        result = subprocess.run(command, check=True, capture_output=True, timeout=300)
+    Args:
+        request: 转录请求
         
-        if not os.path.exists(audio_output_path) or os.path.getsize(audio_output_path) == 0:
-            raise Exception("Failed to create valid audio file")
-
-        # 语音识别
-        rec = KaldiRecognizer(model, 16000)
-        rec.SetWords(True)
-        wf = open(audio_output_path, "rb")
-        wf.read(44)  # Skip WAV header
-
-        results = []
-        logger.info("开始语音识别...")
-        while True:
-            data = wf.read(4000)
-            if len(data) == 0:
-                break
-            if rec.AcceptWaveform(data):
-                result = json.loads(rec.Result())
-                if "result" in result and result["result"]:
-                    results.extend(result["result"])
-
-        final_result = json.loads(rec.FinalResult())
-        if "result" in final_result and final_result["result"]:
-            results.extend(final_result["result"])
-
-        logger.info(f"识别完成，获得 {len(results)} 个词语")
-
-        # 保存转录结果到数据库
-        db = SessionLocal()        
-        try:
-            # 存储相对路径到数据库
-            relative_path = f"uploads/{os.path.basename(file_path)}"  # 不带前导斜杠
-            video_id = os.path.basename(file_path)
+    Returns:
+        转录结果
+    """
+    try:
+        # 处理JSON请求方式
+        absolute_path = os.path.join(backend_dir, request.file_path)
+        results = transcription_service.transcribe(absolute_path, request.model)
+        response = {"transcript": results}
+        print(f"转录API响应: {response}")
+        return response
             
-            # 首先尝试查找现有记录
-            existing_record = db.query(Transcription).filter_by(video_id=video_id).first()
-            
-            if existing_record:
-                # 更新现有记录
-                existing_record.file_path = relative_path
-                existing_record.transcription = json.dumps(results, ensure_ascii=False)
-            else:
-                # 创建新记录
-                transcription_record = Transcription(
-                    video_id=video_id,
-                    file_path=relative_path,
-                    transcription=json.dumps(results, ensure_ascii=False)
-                )
-                db.add(transcription_record)
-                
-            db.commit()
-        finally:
-            db.close()
-
-        return {"transcript": results}
-
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=408, detail="Audio processing timeout")
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.decode() if e.stderr else str(e)
-        raise HTTPException(status_code=500, detail=f"Audio conversion failed: {error_msg}")
     except Exception as e:
-        logger.error(f"转录失败: {e}")
-        raise HTTPException(status_code=500, detail=f"Transcription error: {str(e)}")
-    finally:
-        if wf:
-            wf.close()
-        if audio_output_path and os.path.exists(audio_output_path):
-            try:
-                os.remove(audio_output_path)
-            except Exception as e:
-                logger.warning(f"清理临时音频文件失败: {e}")
+        logger.error(f"转录过程出错: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/transcribe_file")
+async def transcribe_file_upload(file: UploadFile = File(...), model: str = Form("vosk")):
+    """
+    转录音频文件 - 文件上传方式
+    
+    Args:
+        file: 上传的音频/视频文件
+        model: 转录模型选择
+        
+    Returns:
+        转录结果
+    """
+    try:
+        # 处理文件上传方式
+        if file.filename is None:
+            raise HTTPException(status_code=400, detail="File name is missing.")
+        
+        # 保存临时文件
+        file_extension = Path(file.filename).suffix.lower()
+        temp_filename = f"temp_{uuid4()}{file_extension}"
+        temp_path = os.path.join(directories["temp"], temp_filename)
+        
+        content = await file.read()
+        with open(temp_path, "wb") as f:
+            f.write(content)
+        
+        try:
+            # 执行转录
+            results = transcription_service.transcribe(temp_path, model)
+            response = {"transcript": results}
+            print(f"文件上传转录API响应: {response}")
+            return response
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            
+    except Exception as e:
+        logger.error(f"转录过程出错: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/clip_video")
 async def clip_video(
@@ -692,7 +637,8 @@ async def clip_video(
         
         if not os.path.exists(output_path):
             raise Exception("Output file was not created")
-            return {
+            
+        return {
             "success": True,
             "clip_path": output_path,
             "clip_url": f"clips/{output_filename}",  # 不带前导斜杠，与其他接口保持一致
@@ -722,10 +668,6 @@ async def shutdown_event():
 # --- 静态文件服务配置 ---
 # 注意：这些配置必须放在所有路由定义之后
 from fastapi.staticfiles import StaticFiles
-
-# 确保目录存在
-for directory in ["uploads", "clips", "processed_videos"]:
-    os.makedirs(os.path.join(app_dir, directory), exist_ok=True)
 
 # 挂载静态文件目录
 app.mount("/uploads", StaticFiles(directory=directories["uploads"]), name="uploads")

@@ -11,7 +11,13 @@
                   'highlight': index === highlightedWordIndex,
                   'selected': selectedWordIndices.includes(index)
               }"
-              @click="seekToWord(word.start, index)"
+              :data-start-time="word.start || 0"
+              :data-end-time="word.end || 0"
+              @click="handleWordClick($event, word.start, index)"
+              @mousedown="handleMouseDown($event, index)"
+              @mouseenter="handleWordMouseEnter($event, index)"
+              @mouseleave="handleWordMouseLeave($event, index)"
+              @mouseup="handleMouseUp($event, index)"
           >
               {{ getWordDisplay(word) }}
           </span>
@@ -21,11 +27,14 @@
           <div class="loading-spinner"></div>
           <p>等待转录文本...</p>
       </div>
+      
+
   </div>
 </template>
 
 <script setup>
-import { ref, watch, nextTick } from 'vue';
+import { ref, watch, nextTick, computed } from 'vue';
+import { useEditorStore } from '@/stores/editorStore';
 
 // 接收来自App.vue的props
 const props = defineProps({
@@ -47,13 +56,50 @@ const props = defineProps({
 // 向App.vue发送事件
 const emit = defineEmits(['seek-to-time', 'pause-video']);
 
+// 初始化状态管理
+const editorStore = useEditorStore();
+
 const highlightedWordIndex = ref(-1);
 const lastHighlightedIndex = ref(-1);
 const editorContainer = ref(null);
 const isUserScrolling = ref(false);
 const scrollTimeout = ref(null);
 const isUserSeeking = ref(false); // 新增：标记用户是否正在手动跳转
-const selectedWordIndices = ref([]);
+// 使用计算属性从store获取选中的词语索引
+const selectedWordIndices = computed({
+    get: () => editorStore.currentState.selectedIndices,
+    set: (value) => {
+        // 更新store中的选中状态
+        editorStore.currentState.selectedIndices = value;
+        // 同时更新时间戳信息
+        updateSelectedTimestamps(value);
+    }
+});
+const lastClickedIndex = ref(-1);
+const isDragging = ref(false);
+const dragStartIndex = ref(-1);
+
+
+
+// 更新选中词语的时间戳信息
+const updateSelectedTimestamps = (indices) => {
+    if (!indices || indices.length === 0) {
+        return;
+    }
+    
+    // 获取选中词语的时间戳信息
+    const selectedWords = indices.map(index => {
+        const word = props.transcriptWords[index];
+        return {
+            index,
+            word: getWordDisplay(word),
+            start: word.start || 0,
+            end: word.end || 0
+        };
+    });
+    
+    console.log('Selected words with timestamps:', selectedWords);
+};
 
 
 
@@ -125,14 +171,99 @@ const updateHighlight = (currentTime) => {
 
 
 
+// 处理词语点击事件
+const handleWordClick = (event, startTime, wordIndex) => {
+    // 只在特殊键组合时阻止默认行为，允许正常文本选择
+    if (event.shiftKey || event.ctrlKey || event.metaKey) {
+        event.preventDefault();
+    }
+    
+    if (event.shiftKey && lastClickedIndex.value !== -1) {
+        // Shift+点击：选择范围
+        const start = Math.min(lastClickedIndex.value, wordIndex);
+        const end = Math.max(lastClickedIndex.value, wordIndex);
+        const rangeIndices = [];
+        for (let i = start; i <= end; i++) {
+            rangeIndices.push(i);
+        }
+        selectedWordIndices.value = [...new Set([...selectedWordIndices.value, ...rangeIndices])];
+    } else if (event.ctrlKey || event.metaKey) {
+        // Ctrl/Cmd+点击：切换单个词语选择状态
+        toggleWordSelection(wordIndex);
+        lastClickedIndex.value = wordIndex;
+    } else {
+        // 普通点击：跳转到时间并清除选择
+        selectedWordIndices.value = [];
+        lastClickedIndex.value = wordIndex;
+        seekToWord(startTime, wordIndex);
+    }
+};
+
 // 点击词语选择或取消选择
 const toggleWordSelection = (wordIndex) => {
-  if (selectedWordIndices.value.includes(wordIndex)) {
-    selectedWordIndices.value = selectedWordIndices.value.filter(index => index !== wordIndex);
-  } else {
-    selectedWordIndices.value.push(wordIndex);
-  }
+    if (selectedWordIndices.value.includes(wordIndex)) {
+        selectedWordIndices.value = selectedWordIndices.value.filter(index => index !== wordIndex);
+    } else {
+        selectedWordIndices.value.push(wordIndex);
+    }
 };
+
+// 处理鼠标按下事件
+const handleMouseDown = (event, index) => {
+    if (event.button === 0) { // 只处理左键
+        // 只在没有按住特殊键时启用拖拽选择
+        if (!event.shiftKey && !event.ctrlKey && !event.metaKey) {
+            isDragging.value = true;
+            dragStartIndex.value = index;
+            // 只在拖拽模式下阻止默认行为
+            event.preventDefault();
+        }
+    }
+};
+
+// 处理鼠标进入事件（用于拖拽选择）
+const handleMouseEnter = (event, index) => {
+    if (isDragging.value && dragStartIndex.value !== -1) {
+        // 拖拽选择范围
+        const start = Math.min(dragStartIndex.value, index);
+        const end = Math.max(dragStartIndex.value, index);
+        const rangeIndices = [];
+        for (let i = start; i <= end; i++) {
+            rangeIndices.push(i);
+        }
+        selectedWordIndices.value = rangeIndices;
+    }
+};
+
+// 处理词语悬停进入事件
+const handleWordMouseEnter = (event, index) => {
+    // 先处理拖拽逻辑
+    handleMouseEnter(event, index);
+    // 悬停功能已移除
+};
+
+// 处理词语悬停离开事件
+const handleWordMouseLeave = (event, index) => {
+    // 悬停功能已移除
+};
+
+// 格式化时间显示（保留用于其他功能）
+const formatTime = (seconds) => {
+    if (typeof seconds !== 'number' || isNaN(seconds)) {
+        return '0.00s';
+    }
+    return seconds.toFixed(2) + 's';
+};
+
+// 处理鼠标释放事件
+const handleMouseUp = (event, index) => {
+    if (isDragging.value) {
+        isDragging.value = false;
+        lastClickedIndex.value = index;
+        dragStartIndex.value = -1;
+    }
+};
+
 // 寻找当前时间对应的词语索引 - 改进算法
 const findCurrentWordIndex = (currentTime) => {
     if (!props.transcriptWords.length) return -1;
@@ -240,7 +371,20 @@ const getSelectedDeleteSegments = () => {
 
 // 清除选中的词语
 const clearSelectedWords = () => {
-  selectedWordIndices.value = [];
+    selectedWordIndices.value = [];
+};
+
+// 获取选中词语的详细信息（包含时间戳）
+const getSelectedWordsWithTimestamps = () => {
+    return selectedWordIndices.value.map(index => {
+        const word = props.transcriptWords[index];
+        return {
+            index,
+            word: getWordDisplay(word),
+            start: word.start || 0,
+            end: word.end || 0
+        };
+    });
 };
 
 // 自动滚动到高亮的词语
@@ -317,6 +461,7 @@ defineExpose({
     clearSelectedWords,      // 暴露清除选中词语的方法
     setSelectedWords,
     getSelectedIndices,
+    getSelectedWordsWithTimestamps, // 暴露获取选中词语详细信息的方法
 });
 
 </script>
@@ -366,9 +511,11 @@ defineExpose({
     margin: 0 1px;
     padding: 2px 4px;
     border-radius: 6px;
+    border: 2px solid transparent;
     transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     position: relative;
     line-height: 2;
+    user-select: text;
 }
 
 .word.clickable {
@@ -378,13 +525,15 @@ defineExpose({
 
 .word.clickable:hover {
     background-color: rgba(52, 152, 219, 0.15);
-    transform: scale(1.02);
     box-shadow: 0 2px 8px rgba(52, 152, 219, 0.25);
+    border: 2px solid rgba(52, 152, 219, 0.3);
+    /* 移除transform scale，避免布局跳动 */
 }
 
 .word.clickable:active {
-    transform: scale(0.98);
     background-color: rgba(52, 152, 219, 0.25);
+    box-shadow: 0 1px 4px rgba(52, 152, 219, 0.3);
+    /* 移除transform scale，避免布局跳动 */
 }
 
 .word.highlight {
@@ -392,41 +541,58 @@ defineExpose({
     color: #1a1a1a;
     font-weight: 700;
     box-shadow: 0 3px 12px rgba(255, 235, 59, 0.6);
-    transform: scale(1.05);
     z-index: 1;
+    border: 2px solid rgba(255, 193, 7, 0.6);
     animation: highlightPulse 0.6s cubic-bezier(0.4, 0, 0.2, 1);
-    border: 1px solid rgba(255, 193, 7, 0.4);
+    /* 移除transform scale，避免布局跳动 */
 }
 
 .word.selected {
-    background-color: rgba(244, 67, 54, 0.2);
-    border: 1px solid rgba(244, 67, 54, 0.4);
-    color: #d32f2f;
+    background: linear-gradient(135deg, #e3f2fd, #bbdefb);
+    color: #1565c0;
     font-weight: 600;
+    box-shadow: 0 2px 8px rgba(21, 101, 192, 0.3);
+    border: 2px solid rgba(21, 101, 192, 0.4);
+    position: relative;
+    /* 移除transform scale，避免布局跳动 */
+}
+
+.word.selected::after {
+    content: '';
+    position: absolute;
+    top: -2px;
+    left: -2px;
+    right: -2px;
+    bottom: -2px;
+    border: 2px solid #1976d2;
+    border-radius: 8px;
+    pointer-events: none;
+    opacity: 0.6;
 }
 
 .word.selected.highlight {
-    background: linear-gradient(135deg, #ffeb3b, #ff9800);
-    color: #d32f2f;
+    background: linear-gradient(135deg, #fff3e0, #ffcc02);
+    color: #e65100;
+    border-color: #ff9800;
     font-weight: 700;
     box-shadow: 0 3px 12px rgba(255, 152, 0, 0.6);
 }
 
 @keyframes highlightPulse {
     0% {
-        transform: scale(1);
         background: linear-gradient(135deg, #fff176, #ffeb3b);
         box-shadow: 0 2px 8px rgba(255, 235, 59, 0.4);
+        border-color: rgba(255, 193, 7, 0.4);
     }
     50% {
-        transform: scale(1.08);
         background: linear-gradient(135deg, #ffeb3b, #ffc107);
         box-shadow: 0 4px 16px rgba(255, 235, 59, 0.8);
+        border-color: rgba(255, 193, 7, 0.8);
     }
     100% {
-        transform: scale(1.05);
         background: linear-gradient(135deg, #ffeb3b, #fff176);
         box-shadow: 0 3px 12px rgba(255, 235, 59, 0.6);
+        border-color: rgba(255, 193, 7, 0.6);
     }
 }
 
@@ -495,8 +661,8 @@ defineExpose({
     }
     
     .word.highlight {
-        transform: scale(1.03);
         box-shadow: 0 2px 8px rgba(255, 235, 59, 0.5);
+        border: 2px solid rgba(255, 193, 7, 0.6);
     }
     
     .editor-title {
@@ -520,7 +686,7 @@ defineExpose({
     
     .word.clickable:active {
         background-color: rgba(52, 152, 219, 0.2);
-        transform: scale(0.95);
+        box-shadow: 0 1px 4px rgba(52, 152, 219, 0.3);
     }
 }
 
@@ -572,6 +738,28 @@ defineExpose({
     
     .editor-content {
         scroll-behavior: auto;
+    }
+}
+
+
+
+/* 深色模式下的提示框样式 */
+@media (prefers-color-scheme: dark) {
+    .tooltip-content {
+        background: rgba(52, 73, 94, 0.95);
+        border-color: rgba(255, 255, 255, 0.15);
+    }
+    
+    .word-text {
+        color: #f8f9fa;
+    }
+    
+    .time-label {
+        color: #adb5bd;
+    }
+    
+    .time-value {
+        color: #74b9ff;
     }
 }
 

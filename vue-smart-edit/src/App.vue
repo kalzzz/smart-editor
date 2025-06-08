@@ -103,30 +103,42 @@ const uploadFile = async () => {
         await transcribeFile(fullPath);
 
     } catch (error) {
-        uploadError.value = `文件上传失败: ${error.response?.data?.detail || error.message || error}`;
+        let detailMessage = '发生未知错误';
+        if (error.response?.data?.detail) {
+            detailMessage = error.response.data.detail;
+        } else if (error.message) {
+            detailMessage = error.message;
+        } else if (error.toString && error.toString() !== '[object Object]') {
+            detailMessage = error.toString();
+        }
+        uploadError.value = `文件上传失败: ${detailMessage}`;
         console.error(error);
     } finally {
         loading.value = false;
     }
 };
 
+// 添加模型选择
+const selectedModel = ref('sensevoice'); // 默认使用sensevoice模型
+
 // 调用后端进行语音转文本
 const transcribeFile = async (filePath) => {
     try {
         console.log('转录，文件路径:', filePath);
-        isTranscribing.value = true; // 设置转录状态为true
+        isTranscribing.value = true;
         transcribeStatus.value = '转录中...';
         
-        // 清除之前选中的文本
         if (textEditorRef.value) {
             textEditorRef.value.clearSelectedWords();
         }
 
-        // 从 URL 中提取相对路径
         const relativePath = filePath.replace('http://127.0.0.1:8000/', '');
 
         const transcribeResponse = await axios.post('http://127.0.0.1:8000/transcribe',
-            JSON.stringify(relativePath),
+            {
+                file_path: relativePath,
+                model: selectedModel.value
+            },
             {
                 headers: {
                     'Content-Type': 'application/json'
@@ -134,10 +146,8 @@ const transcribeFile = async (filePath) => {
             }
         );
         
-        // 更新转录文本
         const newTranscript = transcribeResponse.data.transcript || [];
         
-        // 只有在新转录文本与当前不同时才更新
         if (JSON.stringify(newTranscript) !== JSON.stringify(transcriptWords.value)) {
             transcriptWords.value = newTranscript;
             transcribeStatus.value = '转录完成';
@@ -146,11 +156,19 @@ const transcribeFile = async (filePath) => {
         }
         
     } catch (error) {
-        transcribeError.value = `转录失败: ${error.response?.data?.detail || error.message || error}`;
+        let detailMessage = '发生未知错误';
+        if (error.response?.data?.detail) {
+            detailMessage = error.response.data.detail;
+        } else if (error.message) {
+            detailMessage = error.message;
+        } else if (error.toString && error.toString() !== '[object Object]') {
+            detailMessage = error.toString();
+        }
+        transcribeError.value = `转录失败: ${detailMessage}`;
         console.error(error);
         transcribeStatus.value = '转录失败';
     } finally {
-        isTranscribing.value = false; // 设置转录状态为false
+        isTranscribing.value = false;
     }
 };
 
@@ -402,8 +420,19 @@ const handleKeyDown = (event) => {
         return;
     }
     
+    // Delete键: 删除选中的文本
+    if (event.key === 'Delete' || event.key === 'Backspace') {
+        event.preventDefault();
+        // 检查是否有选中的文本
+        if (textEditorRef.value) {
+            const selectedIndices = textEditorRef.value.getSelectedIndices();
+            if (selectedIndices && selectedIndices.length > 0) {
+                deleteSelectedText();
+            }
+        }
+    }
     // Ctrl/Cmd + Z: 撤销
-    if ((event.ctrlKey || event.metaKey) && event.key === 'z' && !event.shiftKey) {
+    else if ((event.ctrlKey || event.metaKey) && event.key === 'z' && !event.shiftKey) {
         event.preventDefault();
         if (canUndo.value) {
             handleUndo();
@@ -526,7 +555,22 @@ const resetState = () => {
                 accept="video/*,audio/*" 
                 class="file-input"
             >
+            
             <div class="upload-controls">
+                <!-- 添加模型选择 -->
+                <div class="model-selection">
+                    <label for="model-select" class="model-label">转录模型</label>
+                    <select 
+                        id="model-select" 
+                        v-model="selectedModel"
+                        :disabled="loading || isTranscribing"
+                        class="model-select"
+                    >
+                        <option value="sensevoice">SenseVoice (默认)</option>
+                        <option value="vosk">Vosk</option>
+                    </select>
+                </div>
+
                 <button 
                     @click="uploadFile" 
                     :disabled="loading" 
@@ -536,7 +580,8 @@ const resetState = () => {
                 </button>
                 
                 <div v-if="!loading && clipPath" class="state-badge">
-                    状态{{ editorStore.$state.stateCounter }}
+                    <span class="state-label">当前状态</span>
+                    <span class="state-number">{{ editorStore.$state.stateCounter }}</span>
                 </div>
             </div>
 
@@ -574,7 +619,7 @@ const resetState = () => {
                     <div class="video-controls">
                         <!-- 当前时间显示 -->
                         <div class="current-time">
-                            当前时间: {{ currentTime.toFixed(1) }}秒
+                            当前时间: {{ currentTime.toFixed(2) }}秒
                         </div>
                         
                         <!-- 编辑控制区 -->
@@ -973,19 +1018,48 @@ html, body {
 /* 新增状态标记样式 */
 .upload-controls {
     display: flex;
+    flex-direction: row;
     align-items: center;
-    gap: 12px;
-    margin-bottom: 16px;
+    gap: 16px;
+    margin-top: 16px;
+    flex-wrap: wrap;
 }
 
 .state-badge {
-    background: #8e44ad;
+    background: linear-gradient(135deg, #667eea, #764ba2);
     color: white;
-    padding: 6px 12px;
-    border-radius: 6px;
-    font-size: 14px;
+    padding: 12px 20px;
+    border-radius: 12px;
+    font-size: 15px;
     font-weight: 600;
-    box-shadow: 0 2px 4px rgba(142, 68, 173, 0.2);
+    box-shadow: 0 4px 12px rgba(118, 75, 162, 0.3);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.3s ease;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    backdrop-filter: blur(10px);
+}
+
+.state-badge:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px rgba(118, 75, 162, 0.4);
+}
+
+.state-label {
+    font-weight: 500;
+    opacity: 0.9;
+}
+
+.state-number {
+    background: rgba(255, 255, 255, 0.2);
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-weight: 700;
+    font-size: 16px;
+    min-width: 24px;
+    text-align: center;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.1);
 }
 
 /* 响应式设计 */
@@ -1062,5 +1136,71 @@ html, body {
 @keyframes spin {
     0% { transform: rotate(0deg); }
     100% { transform: rotate(360deg); }
+}
+
+.model-selection {
+    margin: 16px 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px;
+    background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+    border-radius: 12px;
+    border: 1px solid #dee2e6;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+    transition: all 0.3s ease;
+}
+
+.model-selection:hover {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    transform: translateY(-1px);
+}
+
+.model-label {
+    font-weight: 600;
+    color: #2c3e50;
+    font-size: 16px;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin: 0;
+    flex-shrink: 0;
+}
+
+.model-select {
+    padding: 10px 16px;
+    border: 2px solid #4CAF50;
+    border-radius: 8px;
+    background: linear-gradient(135deg, #ffffff, #f8f9fa);
+    font-size: 15px;
+    font-weight: 500;
+    color: #2c3e50;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    box-shadow: 0 2px 6px rgba(76, 175, 80, 0.2);
+    min-width: 180px;
+}
+
+.model-select:hover:not(:disabled) {
+    border-color: #45a049;
+    box-shadow: 0 4px 12px rgba(76, 175, 80, 0.3);
+    transform: translateY(-1px);
+}
+
+.model-select:focus {
+    outline: none;
+    border-color: #45a049;
+    box-shadow: 0 0 0 3px rgba(76, 175, 80, 0.2);
+}
+
+.model-select:disabled {
+    background: linear-gradient(135deg, #f5f5f5, #e9ecef);
+    border-color: #ced4da;
+    color: #6c757d;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
 }
 </style>
